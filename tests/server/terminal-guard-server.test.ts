@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { saveConfig } from "../../src/config";
 import { clearKeyCooldowns } from "../../src/providers/key-failover";
 import { handleResponses } from "../../src/server/responses";
+import { handleChatCompletions } from "../../src/server/chat-completions";
 import { httpStatusFromTerminalError } from "../../src/lib/errors";
 import { errorDetailFor } from "../../src/usage/error-detail";
 import { inspectResponseLogJson, type RequestLogContext } from "../../src/server/request-log";
@@ -134,6 +135,62 @@ describe("server terminal guard integration", () => {
     const messages = requestBodies[1]?.messages as Array<{ role?: string; content?: Array<{ text?: string }> }>;
     expect(messages.at(-1)?.role).toBe("user");
     expect(messages.at(-1)?.content?.[0]?.text).toContain("你刚才只描述了计划");
+  });
+
+  const chatBody = (stream: boolean) => JSON.stringify({
+    model: "se-claude-opus-4.8",
+    messages: [{ role: "user", content: "请检查这个问题并修复代码" }],
+    tools: [{ type: "function", function: { name: "exec_command", description: "run a command", parameters: { type: "object" } } }],
+    stream,
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
+  });
+
+  test("chat client streaming usage is the final attempt, while the log keeps the summed total", async () => {
+    takeInheritedSpendHome();
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
+    const response = await handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: chatBody(true),
+    }), config, logCtx);
+
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(calls).toBe(2);
+    const usageFrames = text.split("\n").filter(line => line.startsWith("data: {") && line.includes('"prompt_tokens"'))
+      .map(line => JSON.parse(line.slice(6)).usage as { prompt_tokens: number; completion_tokens: number });
+    expect(usageFrames.at(-1)).toMatchObject({ prompt_tokens: 20, completion_tokens: 3 });
+    expect(logCtx.usage?.inputTokens).toBe(30);
+  });
+
+  test("chat client non-streaming usage is the final attempt, while the log keeps the summed total", async () => {
+    takeInheritedSpendHome();
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
+    const response = await handleChatCompletions(new Request("http://localhost/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: chatBody(false),
+    }), config, logCtx);
+
+    const body = await response.json() as { usage: { prompt_tokens: number; completion_tokens: number } };
+    expect(response.status).toBe(200);
+    expect(calls).toBe(2);
+    expect(body.usage).toMatchObject({ prompt_tokens: 20, completion_tokens: 3 });
+    expect(logCtx.usage?.inputTokens).toBe(30);
+  });
+
+  test("a Responses client also reports the final attempt's usage", async () => {
+    takeInheritedSpendHome();
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "se-claude-opus-4.8", input: "请检查这个问题并修复代码", stream: true,
+        tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
+      }),
+    }), config, logCtx);
+
+    const text = await response.text();
+    const completed = text.split("\n").filter(line => line.startsWith("data: {") && line.includes('"response.completed"')).at(-1);
+    const usage = JSON.parse(completed!.slice(6)).response.usage as { input_tokens: number; output_tokens: number };
+    expect(usage).toMatchObject({ input_tokens: 20, output_tokens: 3 });
+    expect(logCtx.usage?.inputTokens).toBe(30);
   });
 
   test("terminal-guard continuation 429 replays on the same key before surfacing", async () => {

@@ -198,6 +198,8 @@ function buildResponseJSONWithBudget(
     if (replacedBytes > 0) budget?.releaseRetained(replacedBytes, { kind });
   };
   let usage: OcxUsage | undefined;
+  // Final-attempt usage when a guard summed attempts into `usage`; the body reports it, the log keeps `usage`.
+  let clientUsage: OcxUsage | undefined;
   let errorEvent: Extract<AdapterEvent, { type: "error" }> | undefined;
   let incompleteEvent: Extract<AdapterEvent, { type: "incomplete" }> | undefined;
   let endTurn: boolean | undefined;
@@ -596,12 +598,14 @@ function buildResponseJSONWithBudget(
       case "incomplete":
         incompleteEvent = e;
         usage = e.usage ?? usage;
+        clientUsage = e.clientUsage;
         sawTerminal = true;
         endTurn = e.endTurn;
         if (e.providerState) options?.onProviderState?.(e.providerState);
         break;
       case "done":
         usage = e.usage;
+        clientUsage = e.clientUsage;
         compactionEncryptedContent = e.compactionEncryptedContent;
         sawTerminal = true;
         endTurn = e.endTurn;
@@ -704,6 +708,6 @@ function buildResponseJSONWithBudget(
       // regardless of which surface it asked for.
       incomplete_details: { reason: "adapter_eof" },
     } : {}),
-    usage: responsesUsage(incompleteEvent?.usage ?? usage),
+    usage: responsesUsage(clientUsage ?? incompleteEvent?.usage ?? usage),
   };
 }

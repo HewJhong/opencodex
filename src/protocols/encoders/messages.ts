@@ -393,12 +393,12 @@ function createAnthropicMessageWriter(
           fail(529, "upstream turn ended without a final answer", true, undefined, true);
           return;
         }
-        finish(sawToolUse ? "tool_use" : "end_turn", responsesUsage(terminal.usage));
+        finish(sawToolUse ? "tool_use" : "end_turn", responsesUsage(terminal.clientUsage ?? terminal.usage));
         return;
       }
       if (terminal.status === "incomplete") {
         const outcome = anthropicIncompleteOutcome(terminal.incomplete?.reason, terminal.incomplete?.message);
-        if ("stopReason" in outcome) finish(outcome.stopReason, terminal.usageOnWire ? responsesUsage(terminal.usage) : null);
+        if ("stopReason" in outcome) finish(outcome.stopReason, terminal.usageOnWire ? responsesUsage(terminal.clientUsage ?? terminal.usage) : null);
         else fail(529, outcome.failMessage, true, undefined, isProxyError(terminal), "stream_incomplete");
         return;
       }

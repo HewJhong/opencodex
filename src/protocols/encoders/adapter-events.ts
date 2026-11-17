@@ -72,6 +72,8 @@ export interface ClientWebSearch {
 export interface EncodedTerminal {
   status: "completed" | "incomplete" | "failed";
   usage?: OcxUsage;
+  /** Final-attempt usage for the client wire when a guard summed attempts into `usage` (spend and log keep `usage`). */
+  clientUsage?: OcxUsage;
   /** Whether the bridged terminal carried a usage object (`usage: null` otherwise). */
   usageOnWire: boolean;
   endTurn?: boolean;
@@ -754,6 +756,7 @@ export function encodeAdapterEventStream(
               status: truncation ? "incomplete" : "completed",
               ...(truncation ? { incomplete: { reason: truncation } } : {}),
               ...(event.usage ? { usage: event.usage } : {}),
+              ...(event.clientUsage ? { clientUsage: event.clientUsage } : {}),
               usageOnWire: true,
               ...(event.endTurn !== undefined ? { endTurn: event.endTurn } : {}),
               completedResponse: true,
@@ -779,6 +782,7 @@ export function encodeAdapterEventStream(
                 ...(event.retryable !== undefined ? { retryable: event.retryable } : {}),
               },
               ...(event.usage ? { usage: event.usage } : {}),
+              ...(event.clientUsage ? { clientUsage: event.clientUsage } : {}),
               usageOnWire: true,
               ...(event.endTurn !== undefined ? { endTurn: event.endTurn } : {}),
               completedResponse: false,

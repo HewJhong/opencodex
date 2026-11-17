@@ -233,13 +233,13 @@ function createChatCompletionWriter(sink: ClientFrameSink, model: string, failur
     webSearchDone() { /* server-side search has no Chat representation */ },
     terminal(terminal) {
       if (terminal.status === "completed") {
-        finish(sawToolUse ? "tool_calls" : "stop", responsesUsage(terminal.usage));
+        finish(sawToolUse ? "tool_calls" : "stop", responsesUsage(terminal.clientUsage ?? terminal.usage));
         return;
       }
       if (terminal.status === "incomplete") {
         const outcome = chatCompletionsIncompleteOutcome(terminal.incomplete?.reason, terminal.incomplete?.message);
         if ("finishReason" in outcome) {
-          finish(outcome.finishReason, terminal.usageOnWire ? responsesUsage(terminal.usage) : null);
+          finish(outcome.finishReason, terminal.usageOnWire ? responsesUsage(terminal.clientUsage ?? terminal.usage) : null);
         } else {
           fail(outcome.originalFailMessage, { contract: "stream_incomplete",
             proxyAuthored: isProxyError(terminal) });

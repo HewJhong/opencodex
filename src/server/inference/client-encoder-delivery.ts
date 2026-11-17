@@ -190,7 +190,7 @@ export async function deliverClientEncodedResponse(input: ClientEncodedDelivery)
     response: {
       ...snapshot(terminal.status),
       ...(terminal.endTurn !== undefined ? { end_turn: terminal.endTurn } : {}),
-      usage: terminal.usageOnWire ? responsesUsage(terminal.usage) : null,
+      usage: terminal.usageOnWire ? responsesUsage(terminal.clientUsage ?? terminal.usage) : null,
       ...(terminal.incomplete ? { incomplete_details: { ...terminal.incomplete } } : {}),
       ...(terminal.error ? { error: terminal.error, last_error: terminal.error } : {}),
       ...(terminal.retryable !== undefined ? { retryable: terminal.retryable } : {}),

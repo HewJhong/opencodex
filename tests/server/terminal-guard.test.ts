@@ -264,6 +264,24 @@ describe("terminal guard", () => {
     expect(actual.filter(event => event.type === "done")).toHaveLength(1);
     expect(actual.some(event => event.type === "assistant_boundary")).toBe(true);
     expect(actual.at(-1)).toMatchObject({ usage: { inputTokens: 30, outputTokens: 5, totalTokens: 35, providerCredits: 0.05 } });
+    expect(actual.at(-1)).toMatchObject({ clientUsage: { inputTokens: 20, outputTokens: 3 } });
+  });
+
+  test("a turn that needs no continuation carries no client usage override", async () => {
+    const actual: AdapterEvent[] = [];
+    for await (const event of guardTerminalEventStream({
+      parsed: parsed("请检查这个问题并修复代码"),
+      firstEvents: (async function* () {
+        yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent;
+        yield { type: "tool_call_end" } as AdapterEvent;
+        yield { type: "done", usage: { inputTokens: 10, outputTokens: 2 } } as AdapterEvent;
+      })(),
+      continuation: () => { throw new Error("unexpected continuation"); },
+      adapterName: "anthropic",
+    })) actual.push(event);
+
+    expect(actual.at(-1)).toMatchObject({ usage: { inputTokens: 10, outputTokens: 2 } });
+    expect(actual.at(-1)).not.toHaveProperty("clientUsage");
   });
 
 
