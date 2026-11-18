@@ -1430,7 +1430,7 @@ export function bridgeToResponsesSSE(
                 await awaitThoughtSignatureDurability();
                 const response = {
                   ...responseSnapshot("incomplete", finishedItems, event.endTurn),
-                  usage: responsesUsage(event.usage),
+                  usage: responsesUsage(event.clientUsage ?? event.usage),
                   incomplete_details: {
                     reason: truncationReasonFor(event.stopReason) ?? "content_filter",
                   },
@@ -1443,7 +1443,7 @@ export function bridgeToResponsesSSE(
                 reportTerminal("incomplete");
               } else {
                 await awaitThoughtSignatureDurability();
-                const response = { ...responseSnapshot("completed", finishedItems, event.endTurn), usage: responsesUsage(event.usage) };
+                const response = { ...responseSnapshot("completed", finishedItems, event.endTurn), usage: responsesUsage(event.clientUsage ?? event.usage) };
                 options?.onCompletedResponse?.(response, event.providerState);
                 options?.onUsage?.(event.usage);
                 emit("response.completed", {
@@ -1471,7 +1471,7 @@ export function bridgeToResponsesSSE(
               options?.onUsage?.(event.usage);
               await awaitThoughtSignatureDurability();
               if (maxOutputCompletion.completed) {
-                const response = { ...responseSnapshot("completed", finishedItems, event.endTurn), usage: responsesUsage(event.usage) };
+                const response = { ...responseSnapshot("completed", finishedItems, event.endTurn), usage: responsesUsage(event.clientUsage ?? event.usage) };
                 options?.onCompletedResponse?.(response, event.providerState);
                 emit("response.completed", { response });
                 reportTerminal("completed");
@@ -1483,7 +1483,7 @@ export function bridgeToResponsesSSE(
                 emit("response.failed", {
                   response: {
                     ...responseSnapshot("failed", finishedItems, event.endTurn),
-                    usage: responsesUsage(event.usage),
+                    usage: responsesUsage(event.clientUsage ?? event.usage),
                     ...refusal,
                   },
                 });
@@ -1494,7 +1494,7 @@ export function bridgeToResponsesSSE(
               emit("response.incomplete", {
                 response: {
                   ...responseSnapshot("incomplete", finishedItems, event.endTurn),
-                  usage: responsesUsage(event.usage),
+                  usage: responsesUsage(event.clientUsage ?? event.usage),
                   incomplete_details: {
                     reason: truncationReasonFor(event.reason) ?? event.reason,
                     ...(event.message ? { message: event.message } : {}),

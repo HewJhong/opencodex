@@ -186,6 +186,15 @@ export function isTerminalGuardPassthroughOnly(event: AdapterEvent): boolean {
   return event.type === "heartbeat" || event.type === "tool_call_delta";
 }
 
+/**
+ * The summed usage stays on `usage` for spend and the request log. A client reads the prompt size
+ * of the response as its context size, so it gets the final attempt alone: both attempts resend
+ * the same conversation, and the sum would show about twice the real context.
+ */
+function finalAttemptUsage(accumulated: OcxUsage | undefined, final: OcxUsage | undefined): { clientUsage?: OcxUsage } {
+  return accumulated && final ? { clientUsage: final } : {};
+}
+
 /** Merge two reported usages (canonical Responses convention). Shared with the advisor guard. */
 export function mergeUsage(first: OcxUsage | undefined, second: OcxUsage | undefined): OcxUsage | undefined {
   if (!first) return second;
@@ -278,13 +287,15 @@ export async function* guardTerminalEventStream(options: GuardedEventStreamOptio
           break;
         }
         const usage = mergeUsage(accumulatedUsage, event.usage);
-        yield usage ? { ...event, usage } : event;
+        yield usage ? { ...event, usage, ...finalAttemptUsage(accumulatedUsage, event.usage) } : event;
         return;
       }
       if (event.type === "incomplete" || event.type === "error") {
         terminalSeen = true;
         const usage = mergeUsage(accumulatedUsage, event.usage);
-        yield usage ? { ...event, usage } : event;
+        yield usage
+          ? { ...event, usage, ...(event.type === "incomplete" ? finalAttemptUsage(accumulatedUsage, event.usage) : {}) }
+          : event;
         return;
       }
       if (analysisEnabled) {

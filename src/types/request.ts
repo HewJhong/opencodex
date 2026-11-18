@@ -526,6 +526,12 @@ export type AdapterEvent =
   | {
       type: "done";
       usage?: OcxUsage;
+      /**
+       * Usage of the final upstream attempt only, set when a guard merged several attempts into
+       * `usage`. `usage` stays the summed total for spend and the request log; the client wire
+       * reports `clientUsage` because that prompt is the context the conversation continues from.
+       */
+      clientUsage?: OcxUsage;
       /** Native opaque compaction ciphertext returned by a Responses backend. */
       compactionEncryptedContent?: string;
       stopReason?: string;
@@ -537,6 +543,8 @@ export type AdapterEvent =
       reason: string;
       message?: string;
       usage?: OcxUsage;
+      /** Final-attempt usage for the client wire; see `done.clientUsage`. */
+      clientUsage?: OcxUsage;
       retryable?: boolean;
       endTurn?: boolean;
       providerState?: OcxProviderContinuationState;
