@@ -238,6 +238,56 @@ On an envelope-echo corrective retry, tool evidence uses the user wire role with
 system instruction to treat it as data; truncation and argument restoration preserve that role.
 These are adapter guidance and replay repairs, not a guarantee of identical provider answers.
 
+## Held Cursor runs
+
+> Decision record: [ADR-8986](../decisions/ADR-8986-cursor-held-runs.md)
+
+`src/adapters/cursor/held-run.ts` and `src/adapters/cursor/live-transport.ts` keep a Cursor Run stream
+open across one client tool call when `OPENCODEX_CURSOR_HELD_STREAM=1` (off by default; the flag is read
+on every request). Without it the adapter cancels the stream at the finalize grace and opens a new run
+whose active turn is the `Continue:` user message, which Grok 4.6 and 4.7 repeat as "the user wants me to
+continue". A held run instead answers the pending exec with an `mcpResult` on the same stream, as the
+Cursor Agent CLI does. Anything the rules below do not allow cancels and replays as before.
+
+A turn parks only when all of these hold.
+
+- The wire model is Grok 4.6 or 4.7, with an optional effort and an optional fast marker, and the
+  transport is HTTP/2.
+- The identity scope is a real credential scope, never the fallback `local` or a per-request
+  `cursor-unowned:` scope.
+- The request stores checkpoints and is not a context reset, so compaction and isolated turns never park.
+- Exactly one bridged exec is pending and the client was given that call's `tool_call_end`. Native
+  Cursor tools that ran earlier in the turn do not prevent parking: the stream continues, so none of
+  that work is repeated.
+
+A later request adopts the run only when all of these match: the same identity scope, the same model,
+the same transport policy (HTTP version and native exec mode), the same tool call id, and the same call
+as it was handed to the client (tool name and arguments, compared after sorting object keys). The
+request must also match a digest of the system text, tool catalog, tool choice, reasoning and output
+settings, and the covered history. Between the covered history and the result there must be only
+assistant messages that carry that one call. The result must be plain text within 512 KiB. The
+conversation id is not part of the key, because a client that sends no thread id (OpenCode over chat
+completions) gets a new random id on every request. A request in the same conversation that does not
+match closes the held run, because the stream is on a branch the client left; without a stable
+conversation id the lease closes it instead. The claim is atomic.
+
+A resume is a send. `runCursorTurnWithRetry` claims before it reserves, then pays the same dispatch hook
+(`beforePhysicalSend`, permit use, physical-send record) as a new connection, and a refused or failing
+reservation closes the run first. Once the result is written the transport raises the same
+`local_side_effect` signal a native exec raises, so the adapter's own recovery and the server's failover
+do not replay the request. An adopted run is never retried by the transport.
+
+While parked the client heartbeat and frame reader keep running, the first-frame and stream-health
+timers stop, and only liveness and accounting frames are accepted. Any other frame (a second tool call,
+text, `turnEnded`) drops the run, and frames already queued behind it are discarded. Server heartbeats do
+not renew the lease. At most 24 runs are held (the oldest closes first), each for 10 minutes after
+parking, and a shutdown hook closes them all. Abort listeners belong to one turn: a signal from an
+earlier request cannot close a run that parked again. A parked run holds its own translator budget and
+takes the resuming request's budget on resume.
+
+Not covered here: parallel tool calls, image results and Codex CLI or App clients use the replay path or
+are untested; the checkpoint committed after several resumes is not verified.
+
 ## Cursor root replay budgets
 
 `src/adapters/cursor/protobuf-request.ts` bounds the replayed root set at 192 blobs and 512 KiB, and

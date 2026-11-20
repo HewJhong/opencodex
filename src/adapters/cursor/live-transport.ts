@@ -11,6 +11,7 @@ import {
   CURSOR_TRANSPORT_MAX_BUFFERED_BYTES,
   CURSOR_TRANSPORT_RESUME_BYTES,
   TranslatorBudgetExceededError,
+  createTranslatorBudget,
   type TranslatorBudget,
 } from "../../lib/translator-budget";
 import { activePromptText, prepareCursorRunRequest } from "./protobuf-request";
@@ -92,6 +93,11 @@ import type { CursorClientMessage, CursorRunRequest, CursorServerMessage } from 
 import type { CursorStreamHealthClock, CursorTransport, CursorTransportFactoryInput } from "./transport";
 import { CursorHttp1BidiConnection } from "./http1-bidi";
 import { isPinnedHttp1 } from "../../lib/upstream-http-version";
+import { decodeCursorCallId } from "./call-id";
+import {
+  heldFrameAllowed, heldParkTarget, heldTransportPolicy, heldResultFrame, newHeldRunState, registerHeldRun, replaceStateInPlace,
+  unregisterHeldRun, type HeldResult, type HeldTransport, type HeldTurnSink,
+} from "./held-run";
 
 const CURSOR_RUN_PATH = "/agent.v1.AgentService/Run";
 const CURSOR_CLIENT_VERSION = "cli-2026.07.08-0c04a8a";
@@ -488,7 +494,7 @@ export function clientToolFinalizeGraceMsForRequest(request: CursorRunRequest, b
   return Math.max(baseGraceMs, expandedGraceMs);
 }
 
-class LiveCursorTransport implements CursorTransport {
+class LiveCursorTransport implements CursorTransport, HeldTransport {
   private session?: http2.ClientHttp2Session;
   private stream?: http2.ClientHttp2Stream;
   private http1Connection?: CursorHttp1BidiConnection;
@@ -525,7 +531,7 @@ class LiveCursorTransport implements CursorTransport {
   private activeClientToolFinalizeGraceMs: number;
   private readonly token: string;
   private readonly mcpManager?: CursorMcpManager;
-  private readonly translatorBudget: TranslatorBudget;
+  private translatorBudget: TranslatorBudget;
   private pendingTransportFrames = 0;
   private transportBufferedBytes = 0;
   private readonly desktopDeps: CursorNativeToolDeps;
@@ -548,6 +554,9 @@ class LiveCursorTransport implements CursorTransport {
   /** Per-transport owner for native-exec / background shells. Must not share conversationId. */
   private readonly shellOwnerId = crypto.randomUUID();
   private capturedCheckpointBytes?: Uint8Array;
+  /** Held-run bookkeeping (held-run.ts). Inert unless OPENCODEX_CURSOR_HELD_STREAM=1 and the turn qualifies. */
+  private readonly held = newHeldRunState();
+  private heldBudget?: TranslatorBudget;
 
   constructor(private readonly input: CursorTransportFactoryInput) {
     this.sessionId = input.sessionId?.trim() || crypto.randomUUID();
@@ -615,6 +624,11 @@ class LiveCursorTransport implements CursorTransport {
 
   async *run(request: CursorRunRequest, signal?: AbortSignal): AsyncIterable<CursorServerMessage> {
     this.requestSignal = signal;
+    if (this.held.adoption) { yield* this.runHeldResume(request, signal); return; }
+    this.held.execs.clear();
+    this.held.announced.clear();
+    this.held.calls.clear();
+    this.held.request = request;
     const queue: Array<{ message: CursorServerMessage; bytes: number }> = [];
     let notify: (() => void) | undefined;
     let done = false;
@@ -663,13 +677,7 @@ class LiveCursorTransport implements CursorTransport {
       fn?.();
     };
 
-    const push = (message: CursorServerMessage) => {
-      const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
-      this.reserveTransportBytes(bytes);
-      if (message.type === "done" || message.type === "error") this.emittedTerminal = true;
-      queue.push({ message, bytes });
-      wake();
-    };
+    const push = this.queuePush(queue, wake);
 
     // Advertise MCP tools before the stream opens — the server only calls tools it was told about.
     await this.prepareMcp();
@@ -743,7 +751,7 @@ class LiveCursorTransport implements CursorTransport {
     });
     this.blobRequestScope = prepared.blobRequestScope;
     try {
-      state = createCursorProtobufEventState({
+      const stateOptions: NonNullable<Parameters<typeof createCursorProtobufEventState>[0]> = {
         clientToolNames: clientToolDefs.map(tool => tool.toolName || tool.name),
         freeformToolNames,
         parallelToolCalls: request.parallelToolCalls,
@@ -757,16 +765,19 @@ class LiveCursorTransport implements CursorTransport {
         ...(prepared.estimatedInputTokens !== undefined
           ? { estimatedInputTokens: prepared.estimatedInputTokens }
           : {}),
-      });
-      this.open(prepared.bytes, signal, state, push, err => {
-        this.releaseBlobRequestScope();
-        failure = err;
-        wake();
-      }, () => {
-        this.releaseBlobRequestScope();
-        done = true;
-        wake();
-      });
+      };
+      state = createCursorProtobufEventState(stateOptions);
+      // The stream callbacks below outlive this call once the run is parked, so they reach the
+      // current turn through `held.sink` instead of closing over this call's queue.
+      this.held.state = state;
+      this.held.stateOptions = stateOptions;
+      this.held.endTurn = () => { done = true; wake(); };
+      this.held.sink = {
+        push,
+        fail: err => { this.releaseBlobRequestScope(); failure = err; wake(); },
+        finish: () => { this.releaseBlobRequestScope(); done = true; wake(); },
+      };
+      this.open(prepared.bytes, signal, state, m => this.held.sink!.push(m), e => this.held.sink!.fail(e), () => this.held.sink!.finish());
     } catch (error) {
       this.releaseBlobRequestScope();
       throw error;
@@ -778,6 +789,7 @@ class LiveCursorTransport implements CursorTransport {
         if (queued) {
           this.releaseTransportBytes(queued.bytes);
           yield queued.message;
+          this.noteDelivered(queued.message);
         }
       }
       if (failure) {
@@ -959,7 +971,189 @@ class LiveCursorTransport implements CursorTransport {
     ]).then(([backgroundReport]) => backgroundReport);
   }
 
+  private queuePush(
+    queue: Array<{ message: CursorServerMessage; bytes: number }>,
+    wake: () => void,
+  ): (message: CursorServerMessage) => void {
+    return message => {
+      const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+      this.reserveTransportBytes(bytes);
+      if (message.type === "done" || message.type === "error") this.emittedTerminal = true;
+      queue.push({ message, bytes });
+      wake();
+    };
+  }
+
+  /** One abort listener per turn. A listener from an earlier turn, or one that fires while parked, does nothing. */
+  private attachAbort(signal: AbortSignal | undefined, fail: (error: Error) => void): void {
+    this.held.removeAbort?.();
+    const generation = this.held.generation;
+    const onAbort = () => {
+      if (generation !== this.held.generation || this.held.parked || this.held.dead) return;
+      void this.close();
+      fail(new Error("Cursor request was aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    this.held.removeAbort = () => signal?.removeEventListener("abort", onAbort);
+  }
+
+  /** A call counts as announced once the consumer has taken its tool_call_end. */
+  private noteDelivered(message: CursorServerMessage): void {
+    const held = this.held;
+    if (message.type === "tool_call_start") {
+      held.currentCall = message.id;
+      held.calls.set(message.id, { name: message.name, args: "" });
+    } else if (message.type === "tool_call_delta" && held.currentCall) {
+      const call = held.calls.get(held.currentCall);
+      if (call) call.args += message.arguments;
+    } else if (message.type === "tool_call_end" && message.id) {
+      held.announced.add(message.id);
+      held.currentCall = undefined;
+    }
+  }
+
+  /** Keep the stream open instead of cancelling it, when exactly one announced bridged call is pending. */
+  private tryPark(): boolean {
+    const target = heldParkTarget(this.held, this.http1Connection !== undefined);
+    if (!target || this.expectedClose) return false;
+    const held = this.held;
+    const key = registerHeldRun({ request: held.request!, policy: heldTransportPolicy(this.input.provider), toolCallId: target.toolCallId, call: target.call, owner: this, handle: this });
+    if (!key) return false;
+    held.key = key;
+    held.parked = true;
+    held.removeAbort?.();
+    held.removeAbort = undefined;
+    this.clearFirstFrameTimer();
+    this.clearStreamHealthTimer();
+    // The request's budget is disposed when its response ends; a parked run keeps its own.
+    const own = createTranslatorBudget();
+    this.heldBudget = own;
+    this.translatorBudget = own;
+    held.sink = { push: () => {}, fail: () => this.heldDie("stream-error"), finish: () => this.heldDie("stream-finished") };
+    held.endTurn?.();
+    return true;
+  }
+
+  /** True once a held resume wrote the client's result to Cursor. Replaying the request after that repeats work. */
+  heldResultWritten(): boolean {
+    return this.held.resultWritten;
+  }
+
+  heldUsable(): boolean {
+    return this.held.parked && !this.held.dead;
+  }
+
+  heldAdopt(budget: TranslatorBudget, result: HeldResult, dispatch: () => void): void {
+    this.held.adoption = { budget, result, dispatch };
+  }
+
+  heldDispose(): void {
+    this.held.dead = true;
+    this.held.parked = false;
+    this.expectedClose = true;
+    this.held.removeAbort?.();
+    unregisterHeldRun(this.held.key, this);
+    void this.closeNow();
+  }
+
+  private heldDie(reason: string): void {
+    if (this.held.dead) return;
+    debugProviderDiagnostic("cursor", "held-run-lost", { reason });
+    this.heldDispose();
+  }
+
+  /** Answer the parked exec with the client's result and read the same stream for the next turn. */
+  private async *runHeldResume(request: CursorRunRequest, signal: AbortSignal | undefined): AsyncIterable<CursorServerMessage> {
+    const held = this.held;
+    const { budget, result, dispatch } = held.adoption!;
+    held.adoption = undefined;
+    const exec = [...held.execs.values()][0]!;
+    const queue: Array<{ message: CursorServerMessage; bytes: number }> = [];
+    let notify: (() => void) | undefined;
+    let done = false;
+    let failure: Error | undefined;
+    const wake = () => { const fn = notify; notify = undefined; fn?.(); };
+    // Accounting and cancellation come first. A refused send closes the run before anything is written.
+    try {
+      dispatch();
+      signal?.throwIfAborted();
+    } catch (error) {
+      this.heldDispose();
+      throw error;
+    }
+    held.parked = false;
+    held.generation++;
+    this.requestSignal = signal;
+    this.heldBudget?.dispose();
+    this.heldBudget = undefined;
+    this.translatorBudget = budget;
+    held.endTurn = () => { done = true; wake(); };
+    held.sink = {
+      push: this.queuePush(queue, wake),
+      fail: err => { failure = err; wake(); },
+      finish: () => { done = true; wake(); },
+    };
+    const fresh = createCursorProtobufEventState({
+      ...(held.stateOptions as NonNullable<Parameters<typeof createCursorProtobufEventState>[0]>),
+      translatorBudget: budget,
+      contextUsage: cursorContextUsageTracker.controlsForConversation(request.conversationId, {
+        clearPrior: request.contextUsageReset === true,
+        storeCheckpoints: request.contextUsageStoreCheckpoints !== false,
+      }),
+    });
+    // Cursor sends a toolCallCompleted for the call we just answered. Without this the fresh state
+    // reads it as a new call, hands it to the client a second time and ends the turn on it.
+    for (const answered of held.execs.keys()) fresh.completedToolCalls.add(answered);
+    replaceStateInPlace(held.state!, fresh);
+    held.execs.clear();
+    held.announced.clear();
+    held.calls.clear();
+    held.request = request;
+    this.emittedTerminal = false;
+    this.sawAssistantText = false;
+    this.checkpointGraceExtended = false;
+    this.capturedCheckpointBytes = undefined;
+    this.turnStartedAt = Date.now();
+    this.framesReceived = 0;
+    this.wantsCheckpointCapture = request.contextUsageStoreCheckpoints !== false;
+    this.activeClientToolFinalizeGraceMs = clientToolFinalizeGraceMsForRequest(request, this.clientToolFinalizeGraceMs);
+    this.attachAbort(signal, held.failTurn!);
+    // From here the client's result may be on the wire, so no layer may replay this request. The
+    // same signal a native exec raises: the adapter stops its own recovery and the server stops failover.
+    this.held.resultWritten = true;
+    held.sink.push({ type: "local_side_effect" });
+    this.writeConnectFrame(heldResultFrame(exec, result.text, result.isError));
+    this.lastInboundFrameAt = this.lastMeaningfulFrameAt = this.streamHealthClock.now();
+    this.armStreamHealthTimer(held.failTurn!);
+    while (!done || queue.length > 0) {
+      while (queue.length > 0) {
+        const queued = queue.shift()!;
+        this.releaseTransportBytes(queued.bytes);
+        yield queued.message;
+        this.noteDelivered(queued.message);
+      }
+      if (failure || done) break;
+      await new Promise<void>(resolve => { notify = resolve; });
+    }
+    if (failure) {
+      if (this.expectedClose && isCursorBenignCancelError(failure)) return;
+      if (this.emittedTerminal && isCursorAbortError(failure)) return;
+      const unexpectedCancel = !this.expectedClose && !this.emittedTerminal && isCursorBenignCancelError(failure);
+      throw attachPartialUsage(unexpectedCancel ? new CursorUnexpectedCancelError(failure) : failure, held.state as ReturnType<typeof createCursorProtobufEventState>);
+    }
+  }
+
   async close(): Promise<void> {
+    // A parked run outlives the request that created it; the registry closes it through heldDispose.
+    if (this.held.parked) return;
+    await this.closeNow();
+  }
+
+  private async closeNow(): Promise<void> {
+    this.held.removeAbort?.();
+    unregisterHeldRun(this.held.key, this);
+    this.heldBudget?.dispose();
+    this.heldBudget = undefined;
     const shellCleanup = this.startShellCleanup();
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.turnEndedCloseTimer) clearTimeout(this.turnEndedCloseTimer);
@@ -1103,7 +1297,7 @@ class LiveCursorTransport implements CursorTransport {
         graceMs: graceMsOverride ?? this.activeClientToolFinalizeGraceMs,
         checkpointGraceExtended: this.checkpointGraceExtended,
       });
-      this.cancelCursorRun();
+      if (!this.tryPark()) this.cancelCursorRun();
     };
     this.pendingFinalizeRun = run;
     this.pendingFinalize = setTimeout(run, graceMsOverride ?? this.activeClientToolFinalizeGraceMs);
@@ -1317,7 +1511,7 @@ class LiveCursorTransport implements CursorTransport {
       // timer owned everything before this point).
       const decodedUpdate = decoded.message.case === "interactionUpdate" ? decoded.message.value.message?.case : undefined;
       const livenessOnly = decodedUpdate === "heartbeat" || decoded.message.case === "conversationCheckpointUpdate";
-      if (!this.streamHealthFail) {
+      if (!this.streamHealthFail && !this.held.parked) {
         const now = this.streamHealthClock.now();
         this.lastInboundFrameAt = now;
         this.lastMeaningfulFrameAt = now;
@@ -1515,10 +1709,8 @@ class LiveCursorTransport implements CursorTransport {
       stream!.on("close", () => { void this.startShellCleanup(); });
     }
 
-    signal?.addEventListener("abort", () => {
-      this.close();
-      failAndClear(new Error("Cursor request was aborted"));
-    }, { once: true });
+    this.held.failTurn = failAndClear;
+    this.attachAbort(signal, failAndClear);
     // Close the race between the preflight above and listener installation. No request payload is
     // written until after this check.
     if (signal?.aborted) {
@@ -1545,7 +1737,12 @@ class LiveCursorTransport implements CursorTransport {
     push: (message: CursorServerMessage) => void,
   ): Promise<void> {
     if (!this.stream && !this.http1Connection) return;
+    if (this.held.dead) return;
     debugProviderDiagnostic("cursor", "frame", describeCursorServerFrame(message));
+    if (this.held.parked && !heldFrameAllowed(message)) {
+      this.heldDie("unexpected-frame");
+      return;
+    }
     if (message.message.case === "conversationCheckpointUpdate") {
       try {
         this.capturedCheckpointBytes = toBinary(ConversationStateStructureSchema, message.message.value);
@@ -1575,6 +1772,7 @@ class LiveCursorTransport implements CursorTransport {
         const plan = planMcpArgsHandling(execMsg, state);
         if (plan.handledByResponsesBridge) {
           this.noteClientToolActivity();
+          if (!plan.cancelCursorRun) this.held.execs.set(execMsg.message.value.toolCallId || `exec_${execMsg.id}`, { id: execMsg.id, execId: execMsg.execId });
           for (const event of plan.events) push(event);
           if (plan.cancelCursorRun) this.cancelCursorRun();
           else if (plan.finalizeWhenDrained) this.scheduleClientToolFinalize(state, push);

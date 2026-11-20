@@ -1561,6 +1561,21 @@ multi-user host. Leave local exec off unless every data-plane caller is trusted 
 accept bypassing Codex approval and sandbox semantics.
 :::
 
+### Held stream for Grok tool calls (experimental)
+
+By default OpenCodex ends the Cursor stream at each client tool call and opens a new run when the tool
+result arrives. Grok 4.6 and 4.7 read that new run as a fresh user message and often begin their
+reasoning with "the user wants me to continue". Set the environment variable
+`OPENCODEX_CURSOR_HELD_STREAM=1` before starting the proxy to keep the Cursor stream open across one
+tool call and answer it with the tool result on the same stream, as the Cursor Agent CLI does.
+
+The setting is off by default and applies only to Grok 4.6 and 4.7 over HTTP/2. These cases still use
+the default behavior: several tool calls in one step, image results, `upstreamHttpVersion: "http1.1"`,
+other models, and requests with no identifiable Cursor account. A held stream waits at most ten
+minutes for the tool result and the proxy keeps at most 24 of them. If the stream is gone or the
+conversation changed, OpenCodex falls back to the default behavior. Each held stream uses one open
+connection to Cursor while it waits. Restart the proxy after changing the variable.
+
 ## Zed provider (`adapter: "zed"`)
 
 The Zed Hosted AI bridge is experimental and login-only. Run `ocx login zed` before using it; the
