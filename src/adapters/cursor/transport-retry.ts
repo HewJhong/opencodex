@@ -5,6 +5,7 @@ import type { AttemptRecoveryKind } from "../../usage/log";
 import { SendBudgetExhaustedError, providerErrorDestinationLabel, abortError, retryBackoffDelayMs, sleepWithAbort } from "../../lib/upstream-retry";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { isCursorRootEnvelopeError, safeCursorErrorMessage } from "./cursor-errors";
+import { claimHeldRun } from "./held-run";
 
 // Compat: historical name for the shared abortable sleep, kept for external callers.
 export { sleepWithAbort as abortAwareSleep } from "../../lib/upstream-retry";
@@ -107,6 +108,9 @@ export async function runCursorTurnWithRetry(
   let ordinal = 0;
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) throw abortError(signal);
+    // A parked run that this request continues (held-run.ts). Claimed before the send is admitted so
+    // a refused send can close it instead of leaving it to the lease. Only the first attempt claims.
+    const claim = attempt === 0 ? claimHeldRun(request) : undefined;
     // Admitted before the transport is built: a refused send must not open a connection, and
     // the refusal must reach the adapter as the typed exhaustion rather than as a run failure
     // that the retry predicate below could read as transient.
@@ -115,6 +119,7 @@ export async function runCursorTurnWithRetry(
       targetKey: CURSOR_BUDGET_TARGET_KEY,
     });
     if (decision && !decision.allowed) {
+      claim?.dispose();
       throw new SendBudgetExhaustedError(providerErrorDestinationLabel(CURSOR_BUDGET_TARGET_KEY));
     }
     const permit = decision?.allowed ? decision.permit : undefined;
@@ -125,8 +130,15 @@ export async function runCursorTurnWithRetry(
       execution.onPhysicalSend?.({ ordinal: ++ordinal, ...(attempt > 0 ? { recovery: "connection-reset" } : {}) });
     };
     let transport: CursorTransport;
-    try { transport = makeTransport({ ...input, onRunDispatch }); }
-    catch (error) { permit?.release(); throw error; }
+    try {
+      if (claim) {
+        // A resume writes to an open stream, so it opens no connection; it is still a send and pays
+        // for one through the same dispatch hook (budget permit, ledger, physical-send record).
+        transport = claim.transport;
+        claim.adopt(input.translatorBudget, onRunDispatch);
+      } else transport = makeTransport({ ...input, onRunDispatch });
+    }
+    catch (error) { claim?.dispose(); permit?.release(); throw error; }
     let emittedAny = false;
     let closed = false;
     // Best-effort close: a cleanup failure must never replace the run outcome (or kill
@@ -150,7 +162,9 @@ export async function runCursorTurnWithRetry(
       }
       return;
     } catch (err) {
+      // A resumed run already delivered the client's result; replaying it could repeat tool work.
       const canRetry =
+        !claim &&
         !emittedAny &&
         attempt < CURSOR_RETRY_ATTEMPTS - 1 &&
         !signal?.aborted &&
