@@ -3,10 +3,12 @@ import { create } from "@bufbuild/protobuf";
 import { contentToText } from "../../chat/inbound";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { didRunOptionalShutdownHooks, registerOptionalShutdownHook } from "../../lib/optional-shutdown-hooks";
+import { isPinnedHttp1 } from "../../lib/upstream-http-version";
 import type { TranslatorBudget } from "../../lib/translator-budget";
-import type { OcxMessage, OcxToolResultMessage } from "../../types";
+import type { OcxMessage, OcxProviderConfig, OcxToolResultMessage } from "../../types";
 import { decodeCursorCallId } from "./call-id";
 import { cursorCodexToWireModelId } from "./discovery";
+import { resolveCursorNativeExecMode } from "./exec-policy";
 import { encodeConnectFrame } from "./framing";
 import {
   type AgentServerMessage,
@@ -42,6 +44,14 @@ export const HELD_RUN_MAX = 24;
 /** Larger results take the replay path, which already truncates to the replay budget. */
 export const HELD_RESULT_MAX_BYTES = 512 * 1024;
 
+/**
+ * Settings that shaped the parked transport: the wire version and whether native exec is allowed.
+ * A resume on a route whose settings changed since the park must not reuse the old socket.
+ */
+export function heldTransportPolicy(provider: OcxProviderConfig): string {
+  return `${isPinnedHttp1(provider.upstreamHttpVersion) ? "h1" : "h2"}:${resolveCursorNativeExecMode(provider)}`;
+}
+
 export function heldStreamEnabled(): boolean {
   return process.env.OPENCODEX_CURSOR_HELD_STREAM === "1";
 }
@@ -49,7 +59,8 @@ export function heldStreamEnabled(): boolean {
 /** Grok 4.6 and 4.7 wire ids, including effort and fast forms such as `grok-4.7-medium-fast`. */
 export function isHeldStreamModel(modelId: string): boolean {
   const wire = cursorCodexToWireModelId(modelId).trim().toLowerCase().replace(/^cursor-/, "");
-  return /^grok-4\.[67](?:-|$)/.test(wire);
+  // grok-4.7, grok-4.7-high, grok-4.7-high-fast and the catalog's grok-4.7--fast; nothing else after the version.
+  return /^grok-4\.[67](?:-(?:none|minimal|low|medium|high|xhigh|max))?(?:--?fast)?$/.test(wire);
 }
 
 export function heldRunEligible(request: CursorRunRequest, http1: boolean): boolean {
@@ -57,11 +68,15 @@ export function heldRunEligible(request: CursorRunRequest, http1: boolean): bool
   return heldStreamEnabled()
     && !http1
     && isHeldStreamModel(request.modelId)
-    // "local" is the fallback scope for a request with no identifiable credential. A shared proxy
-    // must not let two such callers meet at the same registry key.
-    && !!scope && scope !== "local"
+    // "local" is the fallback scope for a request with no identifiable credential, and
+    // "cursor-unowned:" is a fresh random scope minted per request, so a run parked under it could
+    // never be claimed. Neither may meet another caller at a registry key.
+    && !!scope && scope !== "local" && !scope.startsWith("cursor-unowned:")
     && request.rawMessages !== undefined
-    && request.echoRetryContinuationText === undefined;
+    && request.echoRetryContinuationText === undefined
+    // Compaction and isolated helper turns store no checkpoint and belong to no thread.
+    && request.contextUsageStoreCheckpoints !== false
+    && request.contextUsageReset !== true;
 }
 
 export interface HeldResult {
@@ -76,6 +91,34 @@ export interface HeldTransport extends CursorTransport {
   /** Arms the next `run()` to answer the pending exec with `result` instead of opening a new run. */
   heldAdopt(budget: TranslatorBudget, result: HeldResult, dispatch: () => void): void;
   heldDispose(): void;
+  heldResultWritten(): boolean;
+}
+
+/** The call exactly as it was handed to the client: tool name and the JSON argument text. */
+export interface HeldCall {
+  name: string;
+  args: string;
+}
+
+/** Key order must not matter: a client may re-serialize the arguments it parsed. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function sameCall(announced: HeldCall, part: { name: string; namespace?: string; arguments?: Record<string, unknown> }): boolean {
+  const qualified = part.namespace ? `${part.namespace}${part.name}` : part.name;
+  if (announced.name !== part.name && announced.name !== qualified) return false;
+  try {
+    const sent = announced.args.trim() === "" ? {} : JSON.parse(announced.args);
+    return canonicalJson(sent) === canonicalJson(part.arguments ?? {});
+  } catch {
+    return false;
+  }
 }
 
 interface HeldEntry {
@@ -83,7 +126,9 @@ interface HeldEntry {
   scope: string;
   conversationId: string;
   modelId: string;
+  policy: string;
   toolCallId: string;
+  call: HeldCall;
   coveredCount: number;
   coverDigest: string;
   owner: object;
@@ -105,8 +150,13 @@ function frame(hash: ReturnType<typeof createHash>, value: string): void {
 
 function messageSignature(message: OcxMessage): string {
   if (message.role === "assistant") {
-    const parts = message.content.map(part =>
-      part.type === "text" ? `t:${part.text}` : part.type === "toolCall" ? `c:${decodeCursorCallId(part.id)}:${part.name}` : `x:${part.type}`);
+    const parts = message.content.map(part => {
+      if (part.type === "text") return `t:${part.text}`;
+      if (part.type === "toolCall") {
+        return `c:${decodeCursorCallId(part.id)}:${part.namespace ?? ""}:${part.name}:${part.customWireName ?? ""}:${JSON.stringify(part.arguments ?? {})}`;
+      }
+      return `x:${part.type}`;
+    });
     return `assistant\0${parts.join("\0")}`;
   }
   return `${message.role}\0${contentToText(message.content)}`;
@@ -120,6 +170,16 @@ function messageSignature(message: OcxMessage): string {
 export function heldCoverDigest(request: CursorRunRequest, coveredCount: number): string {
   const hash = createHash("sha256").update("ocx:cursor:held:");
   frame(hash, request.modelId);
+  // Everything that changes what Cursor was asked for, so a changed effort, mode or output format
+  // cannot adopt a stream that was started under the old ones.
+  frame(hash, JSON.stringify([
+    request.requestedModelParameters ?? null,
+    request.routingLevel ?? null,
+    request.maxMode ?? false,
+    request.parallelToolCalls ?? null,
+    request.textFormat ?? null,
+    request.suppressDefaultCursorToolCatalog ?? false,
+  ]));
   for (const line of request.system) frame(hash, line);
   frame(hash, JSON.stringify(request.tools ?? []));
   frame(hash, JSON.stringify(request.toolChoice ?? null));
@@ -167,7 +227,9 @@ export function resetHeldRunsForTests(): void {
 
 export function registerHeldRun(input: {
   request: CursorRunRequest;
+  policy: string;
   toolCallId: string;
+  call: HeldCall;
   owner: object;
   handle: HeldTransport;
 }): string | undefined {
@@ -187,7 +249,9 @@ export function registerHeldRun(input: {
     scope,
     conversationId: input.request.conversationId,
     modelId: input.request.modelId,
+    policy: input.policy,
     toolCallId: input.toolCallId,
+    call: input.call,
     coveredCount: raw.length,
     coverDigest: heldCoverDigest(input.request, raw.length),
     owner: input.owner,
@@ -212,11 +276,11 @@ export function unregisterHeldRun(key: string | undefined, owner: object): void 
 }
 
 /** The single result the request carries, or undefined when the request is not a clean continuation. */
-function matchEntry(request: CursorRunRequest, entry: HeldEntry): HeldResult | undefined {
+function matchEntry(request: CursorRunRequest, entry: HeldEntry, policy: string): HeldResult | undefined {
   const raw = request.rawMessages;
   const last = raw?.at(-1);
   if (!raw || last?.role !== "toolResult" || request.echoRetryContinuationText !== undefined) return undefined;
-  if (entry.modelId !== request.modelId) return undefined;
+  if (entry.modelId !== request.modelId || entry.policy !== policy) return undefined;
   const result: OcxToolResultMessage = last;
   const toolCallId = decodeCursorCallId(result.toolCallId);
   if (toolCallId !== entry.toolCallId) return undefined;
@@ -228,7 +292,11 @@ function matchEntry(request: CursorRunRequest, entry: HeldEntry): HeldResult | u
   // carries exactly the one pending call. Extra user text, other results or other calls mean the
   // client's branch is not the one this stream is on.
   if (calls.some(call => call === undefined) || calls.length !== 1) return undefined;
-  if (decodeCursorCallId((calls[0] as { id: string }).id) !== toolCallId) return undefined;
+  const sent = calls[0] as { id: string; name: string; namespace?: string; arguments?: Record<string, unknown> };
+  if (decodeCursorCallId(sent.id) !== toolCallId) return undefined;
+  // The result answers the call the model made, so the client's copy of that call must be the one
+  // that was handed to it. An edited or regenerated call with the same id is a different branch.
+  if (!sameCall(entry.call, sent)) return undefined;
   if (heldCoverDigest(request, entry.coveredCount) !== entry.coverDigest) return undefined;
   if (result.containsEncryptedContent) return undefined;
   if (Array.isArray(result.content) && result.content.some(part => part.type !== "text")) return undefined;
@@ -255,14 +323,14 @@ export interface HeldClaim {
  * continue it closes that run, because the stream is on a branch the client has left. The claim is
  * atomic: the entry leaves the registry before the caller does anything else with it.
  */
-export function claimHeldRun(request: CursorRunRequest): HeldClaim | undefined {
-  if (runs.size === 0 || !heldStreamEnabled()) return undefined;
+export function claimHeldRun(request: CursorRunRequest, policy: string): HeldClaim | undefined {
+  if (runs.size === 0 || !heldStreamEnabled() || request.rawMessages?.at(-1)?.role !== "toolResult") return undefined;
   const scope = request._cursorIdentityScope?.trim();
-  if (!scope || scope === "local") return undefined;
+  if (!scope || scope === "local" || scope.startsWith("cursor-unowned:")) return undefined;
   let claimed: { entry: HeldEntry; result: HeldResult } | undefined;
   for (const entry of [...runs.values()]) {
     if (entry.scope !== scope) continue;
-    const result = claimed ? undefined : matchEntry(request, entry);
+    const result = claimed ? undefined : matchEntry(request, entry, policy);
     if (result) {
       claimed = { entry, result };
       continue;
@@ -353,22 +421,27 @@ export interface HeldRunState {
   /** Bridged execs seen this turn by raw tool call id, and the call ids actually announced to the client. */
   execs: Map<string, { id: number; execId: string }>;
   announced: Set<string>;
+  /** Calls as emitted to the client, by raw call id, and the one currently being emitted. */
+  calls: Map<string, HeldCall>;
+  currentCall?: string;
   adoption?: { budget: TranslatorBudget; result: HeldResult; dispatch: () => void };
   sink?: HeldTurnSink;
   endTurn?: () => void;
   removeAbort?: () => void;
   failTurn?: (error: Error) => void;
+  /** Set when a resume wrote the client's result; the request must not be replayed afterwards. */
+  resultWritten: boolean;
 }
 
 export function newHeldRunState(): HeldRunState {
-  return { parked: false, dead: false, generation: 0, execs: new Map(), announced: new Set() };
+  return { parked: false, dead: false, generation: 0, execs: new Map(), announced: new Set(), calls: new Map(), resultWritten: false };
 }
 
 /** The one bridged call a turn may park on, or undefined when the turn does not qualify. */
 export function heldParkTarget(
   held: HeldRunState,
   http1: boolean,
-): { toolCallId: string; exec: { id: number; execId: string } } | undefined {
+): { toolCallId: string; exec: { id: number; execId: string }; call: HeldCall } | undefined {
   const request = held.request;
   const skip = (reason: string): undefined => {
     if (heldStreamEnabled()) {
@@ -382,5 +455,6 @@ export function heldParkTarget(
   if (!heldRunEligible(request, http1)) return skip("not-eligible");
   if (held.execs.size !== 1 || held.announced.size !== 1) return skip("not-single-call");
   const [toolCallId, exec] = [...held.execs][0]!;
-  return held.announced.has(toolCallId) ? { toolCallId, exec } : skip("call-not-announced");
+  const call = held.calls.get(toolCallId);
+  return held.announced.has(toolCallId) && call ? { toolCallId, exec, call } : skip("call-not-announced");
 }

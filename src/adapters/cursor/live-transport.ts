@@ -95,7 +95,7 @@ import { CursorHttp1BidiConnection } from "./http1-bidi";
 import { isPinnedHttp1 } from "../../lib/upstream-http-version";
 import { decodeCursorCallId } from "./call-id";
 import {
-  heldFrameAllowed, heldParkTarget, heldResultFrame, newHeldRunState, registerHeldRun, replaceStateInPlace,
+  heldFrameAllowed, heldParkTarget, heldTransportPolicy, heldResultFrame, newHeldRunState, registerHeldRun, replaceStateInPlace,
   unregisterHeldRun, type HeldResult, type HeldTransport, type HeldTurnSink,
 } from "./held-run";
 
@@ -627,6 +627,7 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
     if (this.held.adoption) { yield* this.runHeldResume(request, signal); return; }
     this.held.execs.clear();
     this.held.announced.clear();
+    this.held.calls.clear();
     this.held.request = request;
     const queue: Array<{ message: CursorServerMessage; bytes: number }> = [];
     let notify: (() => void) | undefined;
@@ -998,7 +999,17 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
 
   /** A call counts as announced once the consumer has taken its tool_call_end. */
   private noteDelivered(message: CursorServerMessage): void {
-    if (message.type === "tool_call_end" && message.id) this.held.announced.add(message.id);
+    const held = this.held;
+    if (message.type === "tool_call_start") {
+      held.currentCall = message.id;
+      held.calls.set(message.id, { name: message.name, args: "" });
+    } else if (message.type === "tool_call_delta" && held.currentCall) {
+      const call = held.calls.get(held.currentCall);
+      if (call) call.args += message.arguments;
+    } else if (message.type === "tool_call_end" && message.id) {
+      held.announced.add(message.id);
+      held.currentCall = undefined;
+    }
   }
 
   /** Keep the stream open instead of cancelling it, when exactly one announced bridged call is pending. */
@@ -1006,7 +1017,7 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
     const target = heldParkTarget(this.held, this.http1Connection !== undefined);
     if (!target || this.expectedClose) return false;
     const held = this.held;
-    const key = registerHeldRun({ request: held.request!, toolCallId: target.toolCallId, owner: this, handle: this });
+    const key = registerHeldRun({ request: held.request!, policy: heldTransportPolicy(this.input.provider), toolCallId: target.toolCallId, call: target.call, owner: this, handle: this });
     if (!key) return false;
     held.key = key;
     held.parked = true;
@@ -1023,6 +1034,11 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
     return true;
   }
 
+  /** True once a held resume wrote the client's result to Cursor. Replaying the request after that repeats work. */
+  heldResultWritten(): boolean {
+    return this.held.resultWritten;
+  }
+
   heldUsable(): boolean {
     return this.held.parked && !this.held.dead;
   }
@@ -1034,6 +1050,7 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
   heldDispose(): void {
     this.held.dead = true;
     this.held.parked = false;
+    this.expectedClose = true;
     this.held.removeAbort?.();
     unregisterHeldRun(this.held.key, this);
     void this.closeNow();
@@ -1090,6 +1107,7 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
     replaceStateInPlace(held.state!, fresh);
     held.execs.clear();
     held.announced.clear();
+    held.calls.clear();
     held.request = request;
     this.emittedTerminal = false;
     this.sawAssistantText = false;
@@ -1100,6 +1118,10 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
     this.wantsCheckpointCapture = request.contextUsageStoreCheckpoints !== false;
     this.activeClientToolFinalizeGraceMs = clientToolFinalizeGraceMsForRequest(request, this.clientToolFinalizeGraceMs);
     this.attachAbort(signal, held.failTurn!);
+    // From here the client's result may be on the wire, so no layer may replay this request. The
+    // same signal a native exec raises: the adapter stops its own recovery and the server stops failover.
+    this.held.resultWritten = true;
+    held.sink.push({ type: "local_side_effect" });
     this.writeConnectFrame(heldResultFrame(exec, result.text, result.isError));
     this.lastInboundFrameAt = this.lastMeaningfulFrameAt = this.streamHealthClock.now();
     this.armStreamHealthTimer(held.failTurn!);
@@ -1715,6 +1737,7 @@ class LiveCursorTransport implements CursorTransport, HeldTransport {
     push: (message: CursorServerMessage) => void,
   ): Promise<void> {
     if (!this.stream && !this.http1Connection) return;
+    if (this.held.dead) return;
     debugProviderDiagnostic("cursor", "frame", describeCursorServerFrame(message));
     if (this.held.parked && !heldFrameAllowed(message)) {
       this.heldDie("unexpected-frame");

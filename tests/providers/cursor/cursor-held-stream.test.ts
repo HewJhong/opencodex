@@ -23,6 +23,7 @@ import {
   heldFrameAllowed,
   heldRunCount,
   heldRunEligible,
+  heldTransportPolicy,
   isHeldStreamModel,
   registerHeldRun,
   resetHeldRunsForTests,
@@ -122,8 +123,11 @@ function turnEndedFrame(): Uint8Array {
 const CATALOG = [{ name: "read_file", description: "read", parameters: { type: "object", properties: { path: { type: "string" } } } }];
 const WIRE = cursorToolWireName(CATALOG[0]!, CATALOG);
 
+const POLICY = heldTransportPolicy({ adapter: "cursor", baseUrl: "x", apiKey: "t" } as never);
+const claim_ = (request: CursorRunRequest) => claimHeldRun(request, POLICY);
+
 const userMessage = (text: string): OcxMessage => ({ role: "user", content: text, timestamp: 1 });
-const assistantCall = (id: string, name = WIRE): OcxMessage => ({
+const assistantCall = (id: string, name = "read_file"): OcxMessage => ({
   role: "assistant", content: [{ type: "toolCall", id, name, arguments: { path: "d1.txt" } }], timestamp: 2,
 });
 const toolResult = (id: string, content: string, extra: Partial<Extract<OcxMessage, { role: "toolResult" }>> = {}): OcxMessage => ({
@@ -231,7 +235,7 @@ describe("held run gate", () => {
     for (const id of ["grok-4.6", "grok-4.7", "grok-4.7-medium-fast", "grok-4.6-xhigh", "cursor/grok-4.7--fast", "cursor-grok-4.7-high"]) {
       expect(isHeldStreamModel(id)).toBe(true);
     }
-    for (const id of ["grok-4.5", "grok-4.70", "composer-2.5", "claude-sonnet-5-5", "gpt-5", "default", "grok-5"]) {
+    for (const id of ["grok-4.5", "grok-4.70", "grok-4.7-experimental", "grok-4.7-high-extra", "grok-4.7-fast-high", "composer-2.5", "claude-sonnet-5-5", "gpt-5", "default", "grok-5"]) {
       expect(isHeldStreamModel(id)).toBe(false);
     }
   });
@@ -239,6 +243,7 @@ describe("held run gate", () => {
   test("a request without a real identity scope, with HTTP/1, or in an echo retry never qualifies", () => {
     expect(heldRunEligible(baseRequest([userMessage("x")], { _cursorIdentityScope: "local" }), false)).toBe(false);
     expect(heldRunEligible(baseRequest([userMessage("x")], { _cursorIdentityScope: undefined }), false)).toBe(false);
+    expect(heldRunEligible(baseRequest([userMessage("x")], { _cursorIdentityScope: "cursor-unowned:abc" }), false)).toBe(false);
     expect(heldRunEligible(baseRequest([userMessage("x")]), true)).toBe(false);
     expect(heldRunEligible(baseRequest([userMessage("x")], { echoRetryContinuationText: "again" }), false)).toBe(false);
   });
@@ -261,26 +266,27 @@ describe("held run registry", () => {
     heldUsable: () => true,
     heldAdopt: () => { log.push("adopt"); },
     heldDispose: () => { log.push("dispose"); },
+    heldResultWritten: () => false,
   });
   const parkedRaw = [userMessage("read d1")];
   const continuation = (callId: string, extra: OcxMessage[] = []) => [...parkedRaw, assistantCall(callId), toolResult(callId, "teal"), ...extra];
   const park = (log: string[], callId = "call-1", overrides: Partial<CursorRunRequest> = {}) =>
-    registerHeldRun({ request: baseRequest(parkedRaw, overrides), toolCallId: callId, owner: log, handle: handle(log) });
+    registerHeldRun({ request: baseRequest(parkedRaw, overrides), policy: POLICY, toolCallId: callId, call: { name: "read_file", args: "{\"path\":\"d1.txt\"}" }, owner: log, handle: handle(log) });
 
   test("a continuation with the same history, model and tools claims the run exactly once", () => {
     const log: string[] = [];
     park(log);
     expect(heldRunCount()).toBe(1);
-    const claim = claimHeldRun(baseRequest(continuation("call-1")));
+    const claim = claim_(baseRequest(continuation("call-1")));
     expect(claim).toBeDefined();
     expect(heldRunCount()).toBe(0);
-    expect(claimHeldRun(baseRequest(continuation("call-1")))).toBeUndefined();
+    expect(claim_(baseRequest(continuation("call-1")))).toBeUndefined();
   });
 
   test("a different identity scope never claims the run and does not close it", () => {
     const log: string[] = [];
     park(log);
-    expect(claimHeldRun(baseRequest(continuation("call-1"), { _cursorIdentityScope: "scope-b" }))).toBeUndefined();
+    expect(claim_(baseRequest(continuation("call-1"), { _cursorIdentityScope: "scope-b" }))).toBeUndefined();
     expect(heldRunCount()).toBe(1);
     expect(log).toEqual([]);
   });
@@ -288,14 +294,14 @@ describe("held run registry", () => {
   test("a client without a thread id gets a new conversation id per request and still claims its run", () => {
     park([]);
     // OpenCode over chat completions sends no thread id, so the id differs on every request.
-    expect(claimHeldRun(baseRequest(continuation("call-1"), { conversationId: "cursor_other_random_id" }))).toBeDefined();
+    expect(claim_(baseRequest(continuation("call-1"), { conversationId: "cursor_other_random_id" }))).toBeDefined();
   });
 
   test("another conversation with a different history does not match and leaves the run alone", () => {
     const log: string[] = [];
     park(log);
     const other = baseRequest([userMessage("unrelated"), assistantCall("call-1"), toolResult("call-1", "x")], { conversationId: "elsewhere" });
-    expect(claimHeldRun(other)).toBeUndefined();
+    expect(claim_(other)).toBeUndefined();
     expect(heldRunCount()).toBe(1);
     expect(log).toEqual([]);
   });
@@ -303,7 +309,7 @@ describe("held run registry", () => {
   test("a forged or wrong tool call id misses and closes the run only through the branch rule", () => {
     const log: string[] = [];
     park(log);
-    expect(claimHeldRun(baseRequest(continuation("call-zzz")))).toBeUndefined();
+    expect(claim_(baseRequest(continuation("call-zzz")))).toBeUndefined();
     // The request is in the same conversation but does not continue the held run, so the run is dropped.
     expect(log).toEqual(["dispose"]);
     expect(heldRunCount()).toBe(0);
@@ -320,17 +326,17 @@ describe("held run registry", () => {
       const log: string[] = [];
       park(log);
       const raw = (change as { rawMessages?: OcxMessage[] }).rawMessages ?? continuation("call-1");
-      expect(claimHeldRun(baseRequest(raw, change))).toBeUndefined();
+      expect(claim_(baseRequest(raw, change))).toBeUndefined();
     }
   });
 
   test("extra user text, a second call or a second result between the prefix and the result does not match", () => {
     const log: string[] = [];
     park(log);
-    expect(claimHeldRun(baseRequest([...parkedRaw, assistantCall("call-1"), userMessage("also this"), toolResult("call-1", "x")]))).toBeUndefined();
+    expect(claim_(baseRequest([...parkedRaw, assistantCall("call-1"), userMessage("also this"), toolResult("call-1", "x")]))).toBeUndefined();
     resetHeldRunsForTests();
     park(log);
-    expect(claimHeldRun(baseRequest([...parkedRaw, assistantCall("call-1"), toolResult("call-1", "x"), assistantCall("call-2"), toolResult("call-2", "y")]))).toBeUndefined();
+    expect(claim_(baseRequest([...parkedRaw, assistantCall("call-1"), toolResult("call-1", "x"), assistantCall("call-2"), toolResult("call-2", "y")]))).toBeUndefined();
   });
 
   test("image, encrypted and oversized results take the replay path", () => {
@@ -342,7 +348,7 @@ describe("held run registry", () => {
     for (const result of cases) {
       resetHeldRunsForTests();
       park([]);
-      expect(claimHeldRun(baseRequest([...parkedRaw, assistantCall("call-1"), result]))).toBeUndefined();
+      expect(claim_(baseRequest([...parkedRaw, assistantCall("call-1"), result]))).toBeUndefined();
     }
   });
 
@@ -364,6 +370,42 @@ describe("held run registry", () => {
     expect(heldRunCount()).toBe(24);
     expect(logs[0]).toEqual(["dispose"]);
     expect(logs[24]).toEqual([]);
+  });
+
+  test("editing the announced call's arguments, or changing effort or output settings, does not match", () => {
+    const edited: OcxMessage = { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read_file", arguments: { path: "other.txt" } }], timestamp: 2 };
+    for (const [raw, overrides] of [
+      [[...parkedRaw, edited, toolResult("call-1", "x")], {}],
+      [continuation("call-1"), { requestedModelParameters: [{ id: "effort", value: "high" }] }],
+      [continuation("call-1"), { parallelToolCalls: true }],
+      [continuation("call-1"), { textFormat: { type: "json_object" } }],
+      [continuation("call-1"), { maxMode: true }],
+    ] as Array<[OcxMessage[], Partial<CursorRunRequest>]>) {
+      resetHeldRunsForTests();
+      park([]);
+      expect(claim_(baseRequest(raw, overrides as Partial<CursorRunRequest>))).toBeUndefined();
+    }
+  });
+
+  test("a changed transport policy (HTTP version or native exec mode) does not adopt the old socket", () => {
+    park([]);
+    const changed = heldTransportPolicy({ adapter: "cursor", baseUrl: "x", apiKey: "t", upstreamHttpVersion: "http1.1" } as never);
+    expect(changed).not.toBe(POLICY);
+    expect(claimHeldRun(baseRequest(continuation("call-1")), changed)).toBeUndefined();
+  });
+
+  test("compaction and isolated turns never qualify to be held", () => {
+    expect(heldRunEligible(baseRequest([userMessage("x")], { contextUsageStoreCheckpoints: false }), false)).toBe(false);
+    expect(heldRunEligible(baseRequest([userMessage("x")], { contextUsageReset: true }), false)).toBe(false);
+  });
+
+  test("a request that is not a tool-result continuation exits before scanning the registry", () => {
+    const log: string[] = [];
+    park(log);
+    expect(claim_(baseRequest([userMessage("a new question")]))).toBeUndefined();
+    // Not a continuation, so it is not evidence the client left the branch either.
+    expect(heldRunCount()).toBe(1);
+    expect(log).toEqual([]);
   });
 
   test("the digest covers history, instructions, tools and model", () => {
@@ -419,7 +461,7 @@ describe("held run transport", () => {
         userMessage("read d1"), assistantCall("call-1"), toolResult("call-1", "File d1 teal"),
         assistantCall("call-2"), toolResult("call-2", "File d2 otter"),
       ]);
-      const claim = claimHeldRun(thirdRequest);
+      const claim = claim_(thirdRequest);
       expect(claim).toBeDefined();
       claim!.dispose();
       expect(heldRunCount()).toBe(0);
@@ -469,6 +511,69 @@ describe("held run transport", () => {
       await waitFor(() => heldRunCount() === 0, "the run to be dropped", 3000);
       expect(heldRunCount()).toBe(0);
       expect(mcpResults(server)).toHaveLength(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("frames queued behind the one that dropped a parked run are not processed", async () => {
+    let wrote: Uint8Array | undefined;
+    const server = await startServer((stream, index) => {
+      if (index !== 0) return;
+      stream.write(startedFrame("call-1", WIRE));
+      stream.write(execFrame(1, "call-1", WIRE));
+      stream.write(completedFrame("call-1", WIRE));
+      stream.write(checkpointFrame());
+      // One TCP chunk carrying a foreign frame followed by a native exec request.
+      setTimeout(() => {
+        const nativeExec = agent({
+          message: { case: "execServerMessage", value: create(ExecServerMessageSchema, { id: 9, execId: "native-1", message: { case: "lsArgs", value: {} as never } }) },
+        });
+        const joined = new Uint8Array(textFrame("surprise").byteLength + nativeExec.byteLength);
+        joined.set(textFrame("surprise")); joined.set(nativeExec, textFrame("surprise").byteLength);
+        wrote = joined;
+        stream.write(joined);
+      }, 200);
+    });
+    try {
+      await runTurn(makeFactory(server.baseUrl), baseRequest([userMessage("read d1")]));
+      await waitFor(() => heldRunCount() === 1, "the run to park");
+      await waitFor(() => wrote !== undefined && heldRunCount() === 0, "the run to be dropped");
+      await new Promise(resolve => setTimeout(resolve, 150));
+      // No reply to the native exec was written back: the run was dead before that frame was handled.
+      const replies = server.clientFrames[0]!.filter(frame => frame.message.case === "execClientMessage" && frame.message.value.id === 9);
+      expect(replies).toHaveLength(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("once a resume wrote the result, a failure is not retried and the request is flagged replay-unsafe", async () => {
+    const server = await startServer((stream, index) => {
+      if (index !== 0) return;
+      stream.write(startedFrame("call-1", WIRE));
+      stream.write(execFrame(1, "call-1", WIRE));
+      stream.write(completedFrame("call-1", WIRE));
+      stream.write(checkpointFrame());
+      // After the client's result arrives the server resets the stream.
+      stream.on("data", () => { if (mcpResults(server).length >= 1) setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 20); });
+    });
+    try {
+      const factory = makeFactory(server.baseUrl);
+      await runTurn(factory, baseRequest([userMessage("read d1")]));
+      await waitFor(() => heldRunCount() === 1, "the run to park");
+      const seen: CursorServerMessage[] = [];
+      let thrown: unknown;
+      try {
+        const budget = createTestTranslatorBudget();
+        await runCursorTurnWithRetry(factory, { provider: { adapter: "cursor", baseUrl: "x", apiKey: "t" }, translatorBudget: budget, headers: new Headers() },
+          baseRequest([userMessage("read d1"), assistantCall("call-1"), toolResult("call-1", "File d1 teal")]), undefined, m => { seen.push(m); });
+      } catch (error) { thrown = error; }
+      expect(thrown).toBeDefined();
+      // The result went out exactly once; no second connection was opened to replay it.
+      expect(mcpResults(server)).toHaveLength(1);
+      expect(server.streams).toHaveLength(1);
+      expect(seen.some(m => m.type === "local_side_effect")).toBe(true);
     } finally {
       await server.close();
     }
